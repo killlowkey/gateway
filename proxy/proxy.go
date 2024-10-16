@@ -221,6 +221,7 @@ func (p *Proxy) buildEndpoint(buildCtx *client.BuildContext, e *config.Endpoint,
 	closer := io.Closer(client)
 	defer closeOnError(closer, &retError)
 
+	// 构建所有的 middleware
 	tripper, err = p.buildMiddleware(e.Middlewares, tripper)
 	if err != nil {
 		return nil, nil, err
@@ -229,64 +230,82 @@ func (p *Proxy) buildEndpoint(buildCtx *client.BuildContext, e *config.Endpoint,
 	if err != nil {
 		return nil, nil, err
 	}
+	// 重试策略
 	retryStrategy, err := prepareRetryStrategy(e)
 	if err != nil {
 		return nil, nil, err
 	}
 	labels := middleware.NewMetricsLabels(e)
+	// 指标：记录成功、记录失败
 	markSuccessStat, markFailedStat := splitRetryMetricsHandler(e)
 	retryBreaker := sre.NewBreaker(sre.WithSuccess(0.8))
 	markSuccess := func(req *http.Request, i int) {
 		markSuccessStat(req, i)
+		// 标记重试为成功
 		if i > 0 {
 			retryBreaker.MarkSuccess()
 		}
 	}
 	markFailed := func(req *http.Request, i int, err error) {
 		markFailedStat(req, i, err)
+		// 标记重试为失败，i > 0 说明已经开启重试了
 		if i > 0 {
 			retryBreaker.MarkFailed()
 		}
 	}
+
+	// 最终流量入口点
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		startTime := time.Now()
 		setXFFHeader(req)
 
 		reqOpts := middleware.NewRequestOptions(e)
-		ctx := middleware.NewRequestContext(req.Context(), reqOpts)
-		ctx, cancel := context.WithTimeout(ctx, retryStrategy.timeout)
+		ctx := middleware.NewRequestContext(req.Context(), reqOpts)    // 设置请求的 option
+		ctx, cancel := context.WithTimeout(ctx, retryStrategy.timeout) //超时机制
 		defer cancel()
 		defer func() {
+			// 指标：记录请求耗时
 			requestsDurationObserve(req, labels, time.Since(startTime).Seconds())
 		}()
 
+		// 读取请求 body，方便后续使用，不然每次失败后，发起重试都需要从最开始 req 读取
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
 			writeError(w, req, err, labels)
 			return
 		}
+
+		// 指标：记录请求 body 长度
 		receivedBytesAdd(req, labels, int64(len(body)))
 		req.GetBody = func() (io.ReadCloser, error) {
 			reader := bytes.NewReader(body)
 			return io.NopCloser(reader), nil
 		}
 
+		// 重试策略
 		var resp *http.Response
 		for i := 0; i < retryStrategy.attempts; i++ {
+			// 当前是否为重试请求
 			if i > 0 {
+				// 当前并未开启重试，直接 break
 				if !retryFeature.Enabled() {
 					break
 				}
+
+				// 是否允许重试（当前系统负载太大，可能也不允许重试了）
 				if err := retryBreaker.Allow(); err != nil {
 					markFailed(req, i, err)
 					break
 				}
 			}
 
+			// 是否为最后一次重试
 			if (i + 1) >= retryStrategy.attempts {
 				reqOpts.LastAttempt = true
 			}
+
 			// canceled or deadline exceeded
+			// context 取消了、超时了
 			if err = ctx.Err(); err != nil {
 				markFailed(req, i, err)
 				break
@@ -295,31 +314,41 @@ func (p *Proxy) buildEndpoint(buildCtx *client.BuildContext, e *config.Endpoint,
 			defer cancel()
 			reader := bytes.NewReader(body)
 			req.Body = io.NopCloser(reader)
+
+			// 发起请求，得到响应
 			resp, err = tripper.RoundTrip(req.Clone(tryCtx))
 			if err != nil {
+				// 标记为失败，继续重试
 				markFailed(req, i, err)
 				log.Errorf("Attempt at [%d/%d], failed to handle request: %s: %+v", i+1, retryStrategy.attempts, req.URL.String(), err)
 				continue
 			}
+
+			// 判断是否需要重试
 			if !judgeRetryRequired(retryStrategy.conditions, resp) {
 				reqOpts.LastAttempt = true
 				markSuccess(req, i)
 				break
 			}
+
+			// 断言失败
 			markFailed(req, i, errors.New("assertion failed"))
 			// continue the retry loop
 		}
+
 		if err != nil {
 			writeError(w, req, err, labels)
 			return
 		}
 
+		// 写入响应头
 		headers := w.Header()
 		for k, v := range resp.Header {
 			headers[k] = v
 		}
 		w.WriteHeader(resp.StatusCode)
 
+		// 写入响应 body
 		doCopyBody := func() bool {
 			if resp.Body == nil {
 				return true
@@ -328,19 +357,28 @@ func (p *Proxy) buildEndpoint(buildCtx *client.BuildContext, e *config.Endpoint,
 			sent, err := io.Copy(w, resp.Body)
 			if err != nil {
 				reqOpts.DoneFunc(ctx, selector.DoneInfo{Err: err})
+				// 指标：响应 body 长度
 				sentBytesAdd(req, labels, sent)
 				log.Errorf("Failed to copy backend response body to client: [%s] %s %s %d %+v\n", e.Protocol, e.Method, e.Path, sent, err)
 				return false
 			}
+
+			// 指标：响应 body 长度
 			sentBytesAdd(req, labels, sent)
+
+			// 调用回调，selector 因为有些策略，通过机器性能、最大请求数量等，判断这个请求是否完成了，从而判断是否将后续请求路由到该节点
 			reqOpts.DoneFunc(ctx, selector.DoneInfo{ReplyMD: getReplyMD(e, resp)})
 			// see https://pkg.go.dev/net/http#example-ResponseWriter-Trailers
 			for k, v := range resp.Trailer {
 				headers[http.TrailerPrefix+k] = v
 			}
+
 			return true
 		}
+
 		doCopyBody()
+
+		// 指标：记录请求总数信息
 		requestsTotalIncr(req, labels, resp.StatusCode)
 	}), closer, nil
 }

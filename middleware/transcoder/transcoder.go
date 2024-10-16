@@ -38,12 +38,14 @@ func init() {
 }
 
 // Middleware is a gRPC transcoder.
+// 用于 rpc 请求编解码
 func Middleware(c *config.Middleware) (middleware.Middleware, error) {
 	return func(next http.RoundTripper) http.RoundTripper {
 		return middleware.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			ctx := req.Context()
 			contentType := req.Header.Get("Content-Type")
 			endpoint, _ := middleware.EndpointFromContext(ctx)
+			// 当前短点配置的协议不是 rpc，或者请求体类型非 application/grpc
 			if endpoint.Protocol != config.Protocol_GRPC || strings.HasPrefix(contentType, "application/grpc") {
 				return next.RoundTrip(req)
 			}
@@ -51,9 +53,12 @@ func Middleware(c *config.Middleware) (middleware.Middleware, error) {
 			if err != nil {
 				return nil, err
 			}
+			// rpc 请求需要在请求 body 前加 5 个字节，用于标识 body 长度
 			bb := make([]byte, len(b)+5)
 			binary.BigEndian.PutUint32(bb[1:], uint32(len(b)))
 			copy(bb[5:], b)
+
+			// 设置请求体类型
 			// content-type:
 			// - application/grpc+json
 			// - application/grpc+proto
@@ -61,14 +66,19 @@ func Middleware(c *config.Middleware) (middleware.Middleware, error) {
 			req.Header.Del("Content-Length")
 			req.ContentLength = int64(len(bb))
 			req.Body = io.NopCloser(bytes.NewReader(bb))
+
+			// 交由下一个 middleware 处理
 			resp, err := next.RoundTrip(req)
 			if err != nil {
 				return nil, err
 			}
+
+			// 读取响应
 			data, err := io.ReadAll(resp.Body)
 			if err != nil {
 				return nil, err
 			}
+			// 将 http2 响应转为 http1
 			// Convert HTTP/2 response to HTTP/1.1
 			// Trailers are sent in a data frame, so don't announce trailers as otherwise downstream proxies might get confused.
 			for trailerName, values := range resp.Trailer {
@@ -76,6 +86,8 @@ func Middleware(c *config.Middleware) (middleware.Middleware, error) {
 			}
 			resp.Trailer = nil
 			resp.Header.Set("Content-Type", contentType)
+
+			// 失败（grpc-status 非 0，表示失败）
 			if grpcStatus := resp.Header.Get("grpc-status"); grpcStatus != "0" {
 				code, err := strconv.ParseInt(grpcStatus, 10, 64)
 				if err != nil {
@@ -94,12 +106,16 @@ func Middleware(c *config.Middleware) (middleware.Middleware, error) {
 						return nil, err
 					}
 				}
+
+				// 转为 json 数据
 				data, err := protojson.Marshal(st)
 				if err != nil {
 					return nil, err
 				}
 				return newResponse(200, resp.Header, data)
 			}
+
+			// 成功
 			resp.Body = io.NopCloser(bytes.NewReader(data[5:]))
 			resp.ContentLength = int64(len(data) - 5)
 			// Any content length that might be set is no longer accurate because of trailers.
