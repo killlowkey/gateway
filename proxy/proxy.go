@@ -254,7 +254,7 @@ func (p *Proxy) buildEndpoint(buildCtx *client.BuildContext, e *config.Endpoint,
 		}
 	}
 
-	// 最终流量入口点
+	// endpoint 的最终流量入口点
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		startTime := time.Now()
 		setXFFHeader(req)
@@ -423,20 +423,29 @@ func closeOnError(closer io.Closer, err *error) {
 
 // Update updates service endpoint.
 func (p *Proxy) Update(buildContext *client.BuildContext, c *config.Gateway) (retError error) {
+
+	// 构建新路由
 	router := mux.NewRouter(http.HandlerFunc(notFoundHandler), http.HandlerFunc(methodNotAllowedHandler))
 	for _, e := range c.Endpoints {
+		// 为 endpoint 构建一个路由 handler
 		handler, closer, err := p.buildEndpoint(buildContext, e, c.Middlewares)
 		if err != nil {
 			return err
 		}
 		defer closeOnError(closer, &retError)
+
+		// 配置 handler
 		if err = router.Handle(e.Path, e.Method, e.Host, handler, closer); err != nil {
 			return err
 		}
 		log.Infof("build endpoint: [%s] %s %s", e.Protocol, e.Method, e.Path)
 	}
+
+	// 替换原先路由
 	old := p.router.Swap(router)
+	// 关闭原先路由
 	tryCloseRouter(old)
+
 	return nil
 }
 
@@ -455,16 +464,21 @@ func tryCloseRouter(in interface{}) {
 	}()
 }
 
+// ServeHTTP 网关流量的入口点
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer func() {
+		// 发生 panic，返回 502
 		if err := recover(); err != nil {
 			w.WriteHeader(http.StatusBadGateway)
+			// 获取堆栈信息
 			buf := make([]byte, 64<<10) //nolint:gomnd
 			n := runtime.Stack(buf, false)
 			log.Errorf("panic recovered: %+v\n%s", err, buf[:n])
 			fmt.Fprintf(os.Stderr, "panic recovered: %+v\n%s\n", err, buf[:n])
 		}
 	}()
+
+	// 加载路由进行处理，最终进入到 muxRouter 的 ServeHTTP，之后加载 endpoint 对应的 handler 处理
 	p.router.Load().(router.Router).ServeHTTP(w, req)
 }
 
